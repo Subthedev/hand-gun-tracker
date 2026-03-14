@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hand Gun Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#08080f;overflow:hidden;font-family:'Rajdhani',sans-serif;cursor:none}
+  #container{position:relative;width:100vw;height:100vh}
+  video{position:absolute;width:1px;height:1px;opacity:0}
+  canvas{position:absolute;top:0;left:0;width:100%;height:100%}
+  #flash{position:absolute;top:0;left:0;width:100%;height:100%;
+    background:rgba(255,200,100,0.4);opacity:0;pointer-events:none;z-index:10;
+    transition:opacity 0.06s ease-out}
+
+  /* ── Loading Screen ── */
+  #loading{position:absolute;top:0;left:0;width:100%;height:100%;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    background:#08080f;z-index:100;transition:opacity 0.8s ease}
+  #loading.hidden{opacity:0;pointer-events:none}
+  #loading h1{font-size:2.2rem;font-weight:700;color:#0ef;
+    text-shadow:0 0 15px rgba(0,238,255,0.5),0 0 40px rgba(0,238,255,0.2);
+    letter-spacing:6px;text-transform:uppercase;margin-bottom:6px}
+  #loading .ver{color:rgba(255,0,255,0.5);font-size:0.75rem;letter-spacing:3px;margin-bottom:30px}
+  .spinner{width:44px;height:44px;border:2px solid rgba(0,238,255,0.1);
+    border-top:2px solid #0ef;border-radius:50%;animation:spin 0.8s linear infinite;margin-bottom:24px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  #loading .status{color:rgba(255,255,255,0.35);font-size:0.85rem;letter-spacing:2px}
+  #loading .hint{color:rgba(255,255,255,0.15);font-size:0.7rem;margin-top:12px}
+</style>
+</head>
+<body>
+
+<div id="container">
+  <video id="video" autoplay playsinline></video>
+  <canvas id="canvas"></canvas>
+  <div id="flash"></div>
+
+  <div id="loading">
+    <h1>Hand Gun Tracker</h1>
+    <p class="ver">CYBERPUNK EDITION</p>
+    <div class="spinner"></div>
+    <p class="status">LOADING HAND TRACKING MODEL...</p>
+    <p class="hint">Allow camera access when prompted</p>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.min.js"></script>
+
+<script>
+'use strict';
+
+// ════════════════════════ CONSTANTS ════════════════════════
+const AMMO_MAX        = 12;
+const RELOAD_FRAMES   = 55;
+const FIRE_COOLDOWN   = 14;
+const BARREL_LEN      = 100;
+const MUZZLE_FRAMES   = 9;
+const SHAKE_MAG       = 10;
+const MAX_PARTICLES   = 300;
+
+// Landmark indices
+const WRIST=0, THUMB_CMC=1, THUMB_MCP=2, THUMB_IP=3, THUMB_TIP=4;
+const INDEX_MCP=5, INDEX_PIP=6, INDEX_DIP=7, INDEX_TIP=8;
+const MID_MCP=9, MID_PIP=10, MID_DIP=11, MID_TIP=12;
+const RING_MCP=13, RING_PIP=14, RING_DIP=15, RING_TIP=16;
+const PINKY_MCP=17, PINKY_PIP=18, PINKY_DIP=19, PINKY_TIP=20;
+
+// ════════════════════════ VECTOR MATH ════════════════════════
+const v2sub  = (a,b) => ({x:a.x-b.x, y:a.y-b.y});
+const v2len  = v => Math.sqrt(v.x*v.x + v.y*v.y);
+const v2dot  = (a,b) => a.x*b.x + a.y*b.y;
+const v2norm = v => { const l=v2len(v)||1; return {x:v.x/l, y:v.y/l}; };
+const v2perp = v => ({x:-v.y, y:v.x});
+const lerp   = (a,b,t) => a+(b-a)*Math.max(0,Math.min(1,t));
+const clamp  = (v,lo,hi) => Math.max(lo,Math.min(hi,v));
+
+function dist3(a,b) {
+  const dx=a.x-b.x, dy=a.y-b.y, dz=(a.z||0)-(b.z||0);
+  return Math.sqrt(dx*dx+dy*dy+dz*dz);
+}
+
+// ════════════════════════ AUDIO ════════════════════════
+class Audio {
+  constructor() {
+    this.ctx = null; this.ok = false;
+    try { this.ctx = new (window.AudioContext||window.webkitAudioContext)(); this.ok = true; } catch(e){}
+  }
+  resume() { if(this.ctx?.state==='suspended') this.ctx.resume(); }
+
+  shot() {
+    if(!this.ok) return; this.resume();
+    const c=this.ctx, t=c.currentTime;
+
+    // Crack: bandpass-filtered noise
+    const dur=0.12, buf=c.createBuffer(1,c.sampleRate*dur,c.sampleRate), d=buf.getChannelData(0);
+    for(let i=0;i<d.length;i++) { const s=i/c.sampleRate; d[i]=(Math.random()*2-1)*Math.exp(-s*30); }
+    const noise=c.createBufferSource(); noise.buffer=buf;
+    const bp=c.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=1400; bp.Q.value=1.5;
+    const ng=c.createGain(); ng.gain.setValueAtTime(0.9,t); ng.gain.exponentialRampToValueAtTime(0.01,t+0.1);
+
+    // Boom: low oscillator
+    const osc=c.createOscillator(); osc.frequency.setValueAtTime(70+Math.random()*20,t);
+    osc.frequency.exponentialRampToValueAtTime(20,t+0.15);
+    const og=c.createGain(); og.gain.setValueAtTime(0.55,t); og.gain.exponentialRampToValueAtTime(0.01,t+0.18);
+
+    // Tail: longer filtered noise
+    const td=0.3, tb=c.createBuffer(1,c.sampleRate*td,c.sampleRate), tdd=tb.getChannelData(0);
+    for(let i=0;i<tdd.length;i++) { const s=i/c.sampleRate; tdd[i]=(Math.random()*2-1)*Math.exp(-s*10)*0.3; }
+    const tn=c.createBufferSource(); tn.buffer=tb;
+    const lp=c.createBiquadFilter(); lp.type='lowpass';
+    lp.frequency.setValueAtTime(3000,t); lp.frequency.exponentialRampToValueAtTime(200,t+0.25);
+    const tg=c.createGain(); tg.gain.setValueAtTime(0.3,t); tg.gain.exponentialRampToValueAtTime(0.01,t+0.3);
+
+    // Compressor
+    const comp=c.createDynamicsCompressor();
+    comp.threshold.value=-10; comp.ratio.value=8;
+
+    // Waveshaper for grit
+    const ws=c.createWaveShaper();
+    const curve=new Float32Array(256);
+    for(let i=0;i<256;i++) curve[i]=Math.tanh(((i*2)/256-1)*2.5);
+    ws.curve=curve;
+
+    noise.connect(bp); bp.connect(ng); ng.connect(ws);
+    osc.connect(og); og.connect(ws);
+    tn.connect(lp); lp.connect(tg); tg.connect(ws);
+    ws.connect(comp); comp.connect(c.destination);
+
+    noise.start(t); noise.stop(t+dur);
+    osc.start(t); osc.stop(t+0.2);
+    tn.start(t); tn.stop(t+td);
+  }
+
+  empty() {
+    if(!this.ok)return; this.resume();
+    const c=this.ctx,t=c.currentTime;
+    const o=c.createOscillator(); o.frequency.value=900;
+    const g=c.createGain(); g.gain.setValueAtTime(0.25,t); g.gain.exponentialRampToValueAtTime(0.01,t+0.04);
+    o.connect(g); g.connect(c.destination); o.start(t); o.stop(t+0.04);
+  }
+
+  reload() {
+    if(!this.ok)return; this.resume();
+    const c=this.ctx,t=c.currentTime;
+    // Metallic slide sound
+    const dur=0.15, buf=c.createBuffer(1,c.sampleRate*dur,c.sampleRate), d=buf.getChannelData(0);
+    for(let i=0;i<d.length;i++){const s=i/c.sampleRate; d[i]=(Math.random()*2-1)*Math.exp(-s*15)*0.4;}
+    const n=c.createBufferSource(); n.buffer=buf;
+    const hp=c.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=2000;
+    const g=c.createGain(); g.gain.setValueAtTime(0.4,t); g.gain.exponentialRampToValueAtTime(0.01,t+0.15);
+    n.connect(hp); hp.connect(g); g.connect(c.destination); n.start(t); n.stop(t+dur);
+    // Click at end
+    const o=c.createOscillator(); o.frequency.value=1500;
+    const g2=c.createGain(); g2.gain.setValueAtTime(0,t);
+    g2.gain.setValueAtTime(0.35,t+0.12); g2.gain.exponentialRampToValueAtTime(0.01,t+0.15);
+    o.connect(g2); g2.connect(c.destination); o.start(t+0.12); o.stop(t+0.16);
+  }
+}
+
+// ════════════════════════ PARTICLE ════════════════════════
+class Particle {
+  constructor(x,y,vx,vy,color,life,size=3,grav=0.1,drag=0.97){
+    this.x=x;this.y=y;this.vx=vx;this.vy=vy;this.color=color;
+    this.life=life;this.maxLife=life;this.size=size;this.grav=grav;this.drag=drag;
+  }
+  update(){this.vx*=this.drag;this.vy*=this.drag;this.vy+=this.grav;this.x+=this.vx;this.y+=this.vy;return--this.life>0;}
+  draw(ctx){
+    const r=this.life/this.maxLife, s=Math.max(0.5,this.size*r);
+    ctx.globalAlpha=r*r; ctx.fillStyle=this.color;
+    ctx.beginPath(); ctx.arc(this.x,this.y,s,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+  }
+}
+
+class Particles {
+  constructor(){this.list=[];}
+  burst(x,y,count,colors,spd,life,spread,dir){
+    for(let i=0;i<count;i++){
+      const a=dir+(Math.random()-0.5)*spread, s=spd[0]+Math.random()*(spd[1]-spd[0]);
+      this.list.push(new Particle(x,y,Math.cos(a)*s,Math.sin(a)*s,
+        colors[Math.floor(Math.random()*colors.length)],
+        life[0]+Math.floor(Math.random()*(life[1]-life[0])),2+Math.random()*3));
+    }
+  }
+  sparks(x,y,dir){this.burst(x,y,30,['#fff','#ffe066','#ff8c00','#ffd700','#ffaa00'],[6,20],[6,25],Math.PI*0.5,dir);}
+  smoke(x,y,dir){
+    for(let i=0;i<8;i++){
+      const a=dir+(Math.random()-0.5)*0.7, s=0.4+Math.random()*1.8;
+      this.list.push(new Particle(x,y,Math.cos(a)*s,Math.sin(a)*s-Math.random()*0.4,
+        ['#666','#888','#555'][Math.floor(Math.random()*3)],
+        30+Math.floor(Math.random()*35),4+Math.random()*5,0.008,0.995));
+    }
+  }
+  update(){this.list=this.list.filter(p=>p.update());if(this.list.length>MAX_PARTICLES)this.list=this.list.slice(-MAX_PARTICLES);}
+  draw(ctx){this.list.forEach(p=>p.draw(ctx));}
+}
+
+// ════════════════════════ MUZZLE FLASH ════════════════════════
+class MuzzleFlash {
+  constructor(){this.on=false;this.f=0;this.x=0;this.y=0;this.a=0;}
+  fire(x,y,a){this.on=true;this.f=MUZZLE_FRAMES;this.x=x;this.y=y;this.a=a;}
+  update(){if(this.on&&--this.f<=0)this.on=false;}
+  draw(ctx){
+    if(!this.on)return;
+    const r=this.f/MUZZLE_FRAMES, {x,y,a}=this;
+    ctx.save();
+    // Additive blending for realistic glow
+    ctx.globalCompositeOperation='lighter';
+
+    // Core flash - irregular star
+    const coreR=45*r;
+    const grad=ctx.createRadialGradient(x,y,0,x,y,coreR);
+    grad.addColorStop(0,`rgba(255,255,255,${r})`);
+    grad.addColorStop(0.25,`rgba(255,240,150,${0.8*r})`);
+    grad.addColorStop(0.5,`rgba(255,150,30,${0.5*r})`);
+    grad.addColorStop(1,'rgba(255,80,0,0)');
+    ctx.fillStyle=grad;
+    ctx.beginPath(); ctx.arc(x,y,coreR,0,Math.PI*2); ctx.fill();
+
+    // Directional spikes (gas jets along barrel)
+    ctx.strokeStyle=`rgba(255,220,120,${0.8*r})`; ctx.lineWidth=3*r;
+    for(let i=0;i<2;i++){
+      const sa=a+(Math.random()-0.5)*0.25;
+      const sl=50*r+Math.random()*30;
+      ctx.beginPath(); ctx.moveTo(x,y);
+      ctx.lineTo(x+Math.cos(sa)*sl,y+Math.sin(sa)*sl); ctx.stroke();
+    }
+
+    // Radial spikes
+    ctx.lineWidth=2*r;
+    for(let i=0;i<6;i++){
+      const sa=a+(Math.PI*2*i/6)+(Math.random()-0.5)*0.4;
+      const sl=25*r+Math.random()*15;
+      ctx.strokeStyle=`rgba(255,180,80,${0.6*r})`;
+      ctx.beginPath(); ctx.moveTo(x,y);
+      ctx.lineTo(x+Math.cos(sa)*sl,y+Math.sin(sa)*sl); ctx.stroke();
+    }
+
+    // White-hot core
+    ctx.fillStyle=`rgba(255,255,255,${r})`;
+    ctx.beginPath(); ctx.arc(x,y,10*r,0,Math.PI*2); ctx.fill();
+
+    ctx.globalCompositeOperation='source-over';
+    ctx.restore();
+  }
+}
+
+// ════════════════════════ SHELL CASING ════════════════════════
+class Shell {
+  constructor(x,y,a){
+    this.x=x;this.y=y;const s=3+Math.random()*5;
+    this.vx=Math.cos(a)*s+(Math.random()-0.5)*2;
+    this.vy=Math.sin(a)*s-2-Math.random()*3;
+    this.rot=Math.random()*Math.PI*2;this.rv=(Math.random()-0.5)*0.5;this.life=50;
+  }
+  update(){this.vy+=0.35;this.vx*=0.99;this.x+=this.vx;this.y+=this.vy;this.rot+=this.rv;return--this.life>0;}
+  draw(ctx){
+    ctx.save();ctx.translate(this.x,this.y);ctx.rotate(this.rot);
+    ctx.globalAlpha=Math.min(1,this.life/15);
+    ctx.fillStyle='#d4a84b';ctx.fillRect(-4,-2,8,4);
+    ctx.fillStyle='#c2883a';ctx.fillRect(-4,-2,2,4);
+    ctx.globalAlpha=1;ctx.restore();
+  }
+}
+
+// ════════════════════════ SCREEN SHAKE ════════════════════════
+class Shake {
+  constructor(){this.m=0;}
+  fire(m=SHAKE_MAG){this.m=m;}
+  update(){this.m*=0.8;if(this.m<0.4)this.m=0;}
+  get(){return this.m<0.5?{x:0,y:0}:{x:(Math.random()*2-1)*this.m,y:(Math.random()*2-1)*this.m};}
+}
+
+// ════════════════════════ GESTURE DETECTOR ════════════════════════
+class GestureDetector {
+  constructor(){
+    this.thumbState='idle'; // idle → cocked → fired
+    this.cooldown=0;
+    this.stableFrames=0;
+    this.prevThumbProj=null;
+    this.smoothThumbProj=0;
+  }
+
+  // Finger curl: ratio of direct distance to chain distance (3D)
+  _curlRatio(lm,mcp,pip,dip,tip){
+    const direct=dist3(lm[mcp],lm[tip]);
+    const chain=dist3(lm[mcp],lm[pip])+dist3(lm[pip],lm[dip])+dist3(lm[dip],lm[tip]);
+    return chain<1e-6?1:direct/chain;
+  }
+
+  // Is finger extended? (orientation-independent)
+  _extended(lm,mcp,pip,dip,tip){
+    return this._curlRatio(lm,mcp,pip,dip,tip) > 0.72;
+  }
+
+  // Is finger curled?
+  _curled(lm,mcp,pip,dip,tip){
+    return this._curlRatio(lm,mcp,pip,dip,tip) < 0.68;
+  }
+
+  /**
+   * Thumb openness: distance from thumb tip to palm center,
+   * normalized by hand size. Truly orientation-independent.
+   * Higher = thumb extended/up, Lower = thumb pressed/down.
+   */
+  _thumbOpenness(lm){
+    // Distance from thumb tip to middle finger MCP (palm center)
+    const d = dist3(lm[THUMB_TIP], lm[MID_MCP]);
+    // Normalize by hand size (wrist to middle MCP)
+    const handSize = dist3(lm[WRIST], lm[MID_MCP]);
+    return handSize < 1e-6 ? 1 : d / handSize;
+    // Thumb up/extended: ~0.7-1.2
+    // Thumb pressed/in: ~0.25-0.45
+  }
+
+  detect(lm, w, h){
+    // ── Finger states (3D curl ratio) ──
+    const indexExt  = this._extended(lm, INDEX_MCP, INDEX_PIP, INDEX_DIP, INDEX_TIP);
+    const midExt    = this._extended(lm, MID_MCP, MID_PIP, MID_DIP, MID_TIP);
+    const ringCurl  = this._curled(lm, RING_MCP, RING_PIP, RING_DIP, RING_TIP);
+    const pinkyCurl = this._curled(lm, PINKY_MCP, PINKY_PIP, PINKY_DIP, PINKY_TIP);
+
+    // Gun: index + middle extended, ring + pinky curled
+    const isGun = indexExt && midExt && ringCurl && pinkyCurl;
+
+    // ── Barrel direction (average of index and middle finger directions) ──
+    const iMcp={x:lm[INDEX_MCP].x*w,y:lm[INDEX_MCP].y*h};
+    const iTip={x:lm[INDEX_TIP].x*w,y:lm[INDEX_TIP].y*h};
+    const mTip={x:lm[MID_TIP].x*w,y:lm[MID_TIP].y*h};
+    // Midpoint between index and middle fingertips
+    const tipMid = {x:(iTip.x+mTip.x)/2, y:(iTip.y+mTip.y)/2};
+    const angle = Math.atan2(tipMid.y-iMcp.y, tipMid.x-iMcp.x);
+    const dx=Math.cos(angle), dy=Math.sin(angle);
+    const barrelTip = {x:tipMid.x+dx*BARREL_LEN, y:tipMid.y+dy*BARREL_LEN};
+    const aimPt     = {x:tipMid.x+dx*500, y:tipMid.y+dy*500};
+
+    // ── Thumb state machine for firing ──
+    const thumbOpen = this._thumbOpenness(lm);
+    // Smooth it to reduce jitter (light EMA)
+    this.smoothThumbProj = this.smoothThumbProj * 0.4 + thumbOpen * 0.6;
+    const tp = this.smoothThumbProj;
+
+    let fired = false;
+
+    if(isGun){
+      this.stableFrames++;
+
+      // Distance-based thresholds (normalized by hand size)
+      // Thumb up/extended: tp ~0.7-1.2 → cocked
+      // Thumb pressed/down: tp ~0.25-0.45 → fire
+      const COCK_THRESH = 0.55;   // thumb clearly extended
+      const FIRE_THRESH = 0.42;   // thumb has pressed down
+
+      if(this.stableFrames >= 1){
+        if(tp > COCK_THRESH){
+          this.thumbState = 'cocked';
+        }
+
+        if(this.thumbState === 'cocked' && tp < FIRE_THRESH && this.cooldown === 0){
+          fired = true;
+          this.thumbState = 'fired';
+          this.cooldown = FIRE_COOLDOWN;
+        }
+
+        // Reset: thumb goes back up
+        if(this.thumbState === 'fired' && tp > COCK_THRESH){
+          this.thumbState = 'cocked';
+        }
+      }
+    } else {
+      this.stableFrames = 0;
+      this.thumbState = 'idle';
+    }
+
+    if(this.cooldown>0) this.cooldown--;
+
+    return {isGun, fired, barrelTip, aimPt, angle, tipMid, iMcp, thumbOpen:tp, thumbState:this.thumbState};
+  }
+
+  detectReload(lm){
+    return this._extended(lm,INDEX_MCP,INDEX_PIP,INDEX_DIP,INDEX_TIP) &&
+           this._extended(lm,MID_MCP,MID_PIP,MID_DIP,MID_TIP) &&
+           this._extended(lm,RING_MCP,RING_PIP,RING_DIP,RING_TIP) &&
+           this._extended(lm,PINKY_MCP,PINKY_PIP,PINKY_DIP,PINKY_TIP);
+  }
+}
+
+// ════════════════════════ GUN RENDERER ════════════════════════
+class GunRenderer {
+  constructor(){
+    this.recoilOffset=0;
+  }
+
+  /**
+   * Draw a detailed pistol silhouette aligned to the hand.
+   * The gun is drawn in local coordinates then transformed.
+   */
+  draw(ctx, anchorX, anchorY, angle, handScale, thumbState, recoil){
+    ctx.save();
+    ctx.translate(anchorX, anchorY);
+    ctx.rotate(angle);
+
+    const sc = handScale * 0.9; // scale relative to hand size
+    ctx.scale(sc, sc);
+
+    // Recoil: kick back on fire
+    const kick = recoil * -8;
+    ctx.translate(kick, 0);
+
+    // ── Gun body ──
+    // Slide (top)
+    ctx.fillStyle = '#2a2a35';
+    ctx.beginPath();
+    ctx.moveTo(-30, -14);
+    ctx.lineTo(75, -14);
+    ctx.lineTo(80, -12);
+    ctx.lineTo(80, -4);
+    ctx.lineTo(75, -3);
+    ctx.lineTo(-25, -3);
+    ctx.lineTo(-30, -5);
+    ctx.closePath();
+    ctx.fill();
+
+    // Slide top highlight
+    ctx.fillStyle = '#3a3a48';
+    ctx.fillRect(-28, -14, 103, 3);
+
+    // Barrel (extends forward)
+    ctx.fillStyle = '#222230';
+    ctx.fillRect(75, -12, 30, 8);
+    // Barrel bore
+    ctx.fillStyle = '#111';
+    ctx.fillRect(103, -10, 4, 4);
+
+    // Frame (lower)
+    ctx.fillStyle = '#333340';
+    ctx.beginPath();
+    ctx.moveTo(-25, -3);
+    ctx.lineTo(50, -3);
+    ctx.lineTo(50, 3);
+    ctx.lineTo(30, 3);
+    // Trigger guard
+    ctx.lineTo(28, 12);
+    ctx.quadraticCurveTo(20, 18, 8, 12);
+    ctx.lineTo(5, 3);
+    ctx.lineTo(-15, 3);
+    // Grip
+    ctx.lineTo(-20, 30);
+    ctx.lineTo(-35, 32);
+    ctx.lineTo(-38, 28);
+    ctx.lineTo(-30, 0);
+    ctx.lineTo(-30, -3);
+    ctx.closePath();
+    ctx.fill();
+
+    // Grip texture lines
+    ctx.strokeStyle = '#2a2a35';
+    ctx.lineWidth = 1;
+    for(let i=0;i<5;i++){
+      const y = 6 + i*5;
+      ctx.beginPath();
+      ctx.moveTo(-18, y);
+      ctx.lineTo(-32, y+2);
+      ctx.stroke();
+    }
+
+    // Trigger
+    ctx.strokeStyle = '#aaa';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(18, 2);
+    ctx.quadraticCurveTo(16, 10, 15, 8);
+    ctx.stroke();
+
+    // Front sight
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(72, -17, 3, 3);
+
+    // Rear sight
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(-10, -17, 2, 3);
+    ctx.fillRect(-4, -17, 2, 3);
+
+    // Ejection port
+    ctx.fillStyle = '#1a1a25';
+    ctx.fillRect(30, -13, 15, 4);
+
+    // Slide serrations
+    ctx.strokeStyle = '#1e1e28';
+    ctx.lineWidth = 1;
+    for(let i=0;i<6;i++){
+      const x = -20 + i*4;
+      ctx.beginPath(); ctx.moveTo(x,-13); ctx.lineTo(x,-4); ctx.stroke();
+    }
+
+    // ── Subtle edge highlight (cyan accent) ──
+    ctx.strokeStyle = 'rgba(0,238,255,0.15)';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(-30,-14); ctx.lineTo(75,-14); ctx.lineTo(80,-12);
+    ctx.stroke();
+
+    // Hammer (thumb state visualization)
+    ctx.save();
+    ctx.translate(-26, -8);
+    const hammerAngle = thumbState==='cocked' ? -0.4 : thumbState==='fired' ? 0.3 : 0;
+    ctx.rotate(hammerAngle);
+    ctx.fillStyle = '#444';
+    ctx.fillRect(-2, -8, 4, 8);
+    ctx.restore();
+
+    ctx.restore();
+  }
+}
+
+// ════════════════════════ HUD ════════════════════════
+class HUD {
+  constructor(w,h){
+    this.w=w; this.h=h;
+    this.ammo=AMMO_MAX; this.reloading=false; this.reloadT=0;
+    this.bangAlpha=0; this.bangScale=1; this.bangText='BANG!';
+    this.shots=0; this.hitMarkers=[]; this.fps=0;
+    this.guns=[]; // active gun states for display
+    this.crosshair=null;
+  }
+
+  fire(){
+    if(this.ammo>0){
+      this.ammo--; this.shots++;
+      this.bangAlpha=1; this.bangScale=2.2;
+      this.bangText=['BANG!','POW!','FIRE!'][Math.floor(Math.random()*3)];
+      return true;
+    }
+    return false;
+  }
+
+  startReload(){
+    if(!this.reloading && this.ammo<AMMO_MAX){this.reloading=true;this.reloadT=RELOAD_FRAMES;}
+  }
+
+  addHit(x,y){this.hitMarkers.push({x,y,a:1});}
+
+  update(fps){
+    this.fps=fps;
+    if(this.bangAlpha>0){this.bangAlpha-=0.04;this.bangScale=Math.max(1.2,this.bangScale-0.05);}
+    if(this.reloading&&--this.reloadT<=0){this.reloading=false;this.ammo=AMMO_MAX;}
+    this.hitMarkers=this.hitMarkers.filter(m=>{m.a-=0.05;return m.a>0;});
+  }
+
+  draw(ctx){
+    const W=this.w, H=this.h;
+    const mono = '"Share Tech Mono",monospace';
+    const sans = '"Rajdhani",sans-serif';
+
+    // ── Corner brackets ──
+    ctx.strokeStyle='rgba(0,238,255,0.35)'; ctx.lineWidth=1.5;
+    const bl=35;
+    [[12,12,1,1],[W-12,12,-1,1],[12,H-12,1,-1],[W-12,H-12,-1,-1]].forEach(([x,y,dx,dy])=>{
+      ctx.beginPath(); ctx.moveTo(x,y+dy*bl); ctx.lineTo(x,y); ctx.lineTo(x+dx*bl,y); ctx.stroke();
+    });
+
+    // ── Ammo panel (bottom-right) ──
+    const panelW=260, panelH=70;
+    const px=W-panelW-20, py=H-panelH-20;
+
+    // Glass panel background
+    ctx.fillStyle='rgba(8,8,20,0.75)';
+    ctx.beginPath();
+    ctx.roundRect(px, py, panelW, panelH, 4);
+    ctx.fill();
+    ctx.strokeStyle='rgba(0,238,255,0.12)';
+    ctx.lineWidth=1;
+    ctx.stroke();
+
+    // Thin accent line at top of panel
+    ctx.fillStyle='rgba(0,238,255,0.3)';
+    ctx.fillRect(px+1, py, panelW-2, 1);
+
+    // Label
+    ctx.font=`600 11px ${sans}`;
+    ctx.fillStyle='rgba(0,238,255,0.5)';
+    ctx.letterSpacing='3px';
+    ctx.fillText('AMMUNITION', px+12, py+16);
+    ctx.letterSpacing='0px';
+
+    // Bullet icons
+    const bStartX=px+12, bY=py+32;
+    for(let i=0;i<AMMO_MAX;i++){
+      const bx=bStartX+i*19;
+      if(i<this.ammo){
+        // Active bullet
+        ctx.fillStyle='rgba(0,238,255,0.85)';
+        ctx.fillRect(bx,bY,11,18);
+        ctx.fillStyle='rgba(212,168,75,0.9)';
+        ctx.fillRect(bx,bY-3,11,4);
+        // Subtle glow
+        ctx.shadowColor='rgba(0,238,255,0.3)'; ctx.shadowBlur=4;
+        ctx.fillStyle='rgba(0,238,255,0.1)';
+        ctx.fillRect(bx-1,bY-1,13,20);
+        ctx.shadowBlur=0;
+      } else {
+        ctx.strokeStyle='rgba(255,255,255,0.08)';
+        ctx.lineWidth=1;
+        ctx.strokeRect(bx,bY,11,18);
+      }
+    }
+
+    // Ammo count text
+    ctx.font=`700 22px ${mono}`;
+    const ammoColor = this.ammo>3?'rgba(0,238,255,0.9)':
+                      this.ammo>1?'rgba(255,200,0,0.9)':'rgba(255,60,60,0.9)';
+    ctx.fillStyle=ammoColor;
+    ctx.fillText(`${String(this.ammo).padStart(2,'0')} / ${AMMO_MAX}`, px+12, py+64);
+
+    // ── Top-left info ──
+    ctx.font=`400 13px ${mono}`;
+    ctx.fillStyle='rgba(0,238,255,0.4)';
+    ctx.fillText(`FPS ${Math.round(this.fps)}`, 22, 38);
+
+    ctx.fillStyle='rgba(255,140,0,0.5)';
+    ctx.fillText(`SHOTS ${String(this.shots).padStart(3,'0')}`, 22, 56);
+
+    // Gun status
+    const hasGun = this.guns.length > 0;
+    if(hasGun){
+      ctx.fillStyle='rgba(0,255,128,0.6)';
+      ctx.font=`600 13px ${sans}`;
+      ctx.fillText('WEAPON ACTIVE', 22, 78);
+      // Pulsing indicator
+      const pulse=0.5+Math.sin(Date.now()/300)*0.5;
+      ctx.fillStyle=`rgba(0,255,128,${0.3+pulse*0.4})`;
+      ctx.beginPath();ctx.arc(14,74,3,0,Math.PI*2);ctx.fill();
+
+      // Thumb state + debug value
+      const gun0 = this.guns[0];
+      const ts = gun0.state;
+      const tVal = gun0.thumbOpen;
+      const tsCol = ts==='cocked'?'rgba(255,255,0,0.6)':ts==='fired'?'rgba(255,60,60,0.6)':'rgba(100,100,100,0.3)';
+      ctx.fillStyle=tsCol;
+      ctx.font=`400 11px ${mono}`;
+      ctx.fillText(ts==='cocked'?'HAMMER COCKED':ts==='fired'?'DISCHARGED':'SAFE', 22, 94);
+
+      // Thumb openness debug bar
+      ctx.fillStyle='rgba(255,255,255,0.06)';
+      ctx.fillRect(22, 100, 120, 6);
+      // Fill based on thumb openness (0-1.2 range mapped to bar)
+      const barW = clamp(tVal / 1.2, 0, 1) * 120;
+      const barCol = tVal > 0.55 ? 'rgba(255,255,0,0.6)' : tVal < 0.42 ? 'rgba(255,60,60,0.6)' : 'rgba(255,255,255,0.3)';
+      ctx.fillStyle=barCol;
+      ctx.fillRect(22, 100, barW, 6);
+      // Threshold markers
+      ctx.fillStyle='rgba(255,255,0,0.5)';
+      ctx.fillRect(22 + (0.55/1.2)*120, 98, 1, 10); // cock threshold
+      ctx.fillStyle='rgba(255,60,60,0.5)';
+      ctx.fillRect(22 + (0.42/1.2)*120, 98, 1, 10); // fire threshold
+      // Value text
+      ctx.fillStyle='rgba(255,255,255,0.3)';
+      ctx.font=`400 9px ${mono}`;
+      ctx.fillText(`THUMB ${tVal.toFixed(2)}`, 22, 118);
+    } else {
+      ctx.fillStyle='rgba(255,255,255,0.15)';
+      ctx.font=`600 13px ${sans}`;
+      ctx.fillText('NO WEAPON', 22, 78);
+    }
+
+    // ── Crosshair ──
+    if(this.crosshair && hasGun){
+      const {x:cx,y:cy}=this.crosshair;
+      ctx.strokeStyle='rgba(0,255,128,0.5)'; ctx.lineWidth=1.5;
+      const g=10, l=16;
+      ctx.beginPath();
+      ctx.moveTo(cx-g-l,cy);ctx.lineTo(cx-g,cy);
+      ctx.moveTo(cx+g,cy);ctx.lineTo(cx+g+l,cy);
+      ctx.moveTo(cx,cy-g-l);ctx.lineTo(cx,cy-g);
+      ctx.moveTo(cx,cy+g);ctx.lineTo(cx,cy+g+l);
+      ctx.stroke();
+      // Center dot
+      ctx.fillStyle='rgba(255,255,255,0.7)';
+      ctx.beginPath();ctx.arc(cx,cy,1.5,0,Math.PI*2);ctx.fill();
+    }
+
+    // ── BANG text ──
+    if(this.bangAlpha>0){
+      ctx.save();
+      ctx.globalCompositeOperation='lighter';
+      ctx.globalAlpha=Math.max(0,this.bangAlpha);
+      ctx.font=`700 ${Math.round(44*this.bangScale)}px ${sans}`;
+      ctx.textAlign='center';
+      ctx.fillStyle=`rgba(255,${Math.round(200*this.bangAlpha)},${Math.round(80*this.bangAlpha)},${this.bangAlpha})`;
+      ctx.fillText(this.bangText, W/2, H/2-40);
+      ctx.textAlign='left';
+      ctx.globalCompositeOperation='source-over';
+      ctx.globalAlpha=1;
+      ctx.restore();
+    }
+
+    // ── Hit markers ──
+    this.hitMarkers.forEach(m=>{
+      ctx.save(); ctx.globalAlpha=m.a;
+      ctx.strokeStyle='rgba(255,255,255,0.8)'; ctx.lineWidth=1.5;
+      const s=10*m.a;
+      ctx.beginPath();
+      ctx.moveTo(m.x-s,m.y-s);ctx.lineTo(m.x+s,m.y+s);
+      ctx.moveTo(m.x+s,m.y-s);ctx.lineTo(m.x-s,m.y+s);
+      ctx.stroke();
+      ctx.globalAlpha=1; ctx.restore();
+    });
+
+    // ── Reload bar ──
+    if(this.reloading){
+      const bw=220, bh=4, bx=(W-bw)/2, by=H-80;
+      const prog=1-this.reloadT/RELOAD_FRAMES;
+      // Background
+      ctx.fillStyle='rgba(8,8,20,0.7)';
+      ctx.fillRect(bx-10,by-22,bw+20,34);
+      // Track
+      ctx.fillStyle='rgba(255,255,255,0.06)';
+      ctx.fillRect(bx,by,bw,bh);
+      // Fill
+      ctx.fillStyle='rgba(0,238,255,0.7)';
+      ctx.fillRect(bx,by,bw*prog,bh);
+      // Glow on fill tip
+      ctx.shadowColor='rgba(0,238,255,0.5)'; ctx.shadowBlur=8;
+      ctx.fillRect(bx+bw*prog-2,by-1,4,bh+2);
+      ctx.shadowBlur=0;
+      // Label
+      ctx.font=`600 12px ${sans}`;
+      ctx.fillStyle='rgba(255,140,0,0.6)';
+      ctx.textAlign='center';
+      ctx.fillText('RELOADING', W/2, by-8);
+      ctx.textAlign='left';
+    }
+  }
+}
+
+// ════════════════════════ MAIN APP ════════════════════════
+class App {
+  constructor(){
+    this.canvas=document.getElementById('canvas');
+    this.ctx=this.canvas.getContext('2d');
+    this.video=document.getElementById('video');
+    this.flashEl=document.getElementById('flash');
+
+    this.detectors=[new GestureDetector(), new GestureDetector()]; // one per hand
+    this.particles=new Particles();
+    this.flash=new MuzzleFlash();
+    this.shells=[];
+    this.shake=new Shake();
+    this.audio=new Audio();
+    this.gun=new GunRenderer();
+    this.hud=null;
+
+    this.recoil=0;
+    this.fc=0; this.fps=0; this.fpsT=performance.now();
+
+    this._resize();
+    window.addEventListener('resize',()=>this._resize());
+    // Enable audio on interaction
+    ['click','touchstart','keydown'].forEach(e=>
+      document.addEventListener(e,()=>this.audio.resume(),{once:true}));
+  }
+
+  _resize(){
+    const w=window.innerWidth, h=window.innerHeight;
+    this.canvas.width=w; this.canvas.height=h;
+    this.W=w; this.H=h;
+    this.hud=new HUD(w,h);
+  }
+
+  async start(){
+    const statusEl=document.querySelector('#loading .status');
+
+    statusEl.textContent='REQUESTING CAMERA...';
+    const stream=await navigator.mediaDevices.getUserMedia({
+      video:{width:{ideal:1280},height:{ideal:720},facingMode:'user'}
+    });
+    this.video.srcObject=stream;
+    await this.video.play();
+
+    statusEl.textContent='LOADING AI MODEL...';
+    this.hands=new Hands({
+      locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`
+    });
+    this.hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.65,
+      minTrackingConfidence: 0.5,
+    });
+    this.hands.onResults(r=>this._frame(r));
+
+    statusEl.textContent='STARTING CAMERA FEED...';
+    this.camera=new Camera(this.video,{
+      onFrame:async()=>{await this.hands.send({image:this.video});},
+      width:1280, height:720,
+    });
+    await this.camera.start();
+
+    document.getElementById('loading').classList.add('hidden');
+  }
+
+  _frame(results){
+    const ctx=this.ctx, W=this.W, H=this.H;
+
+    // FPS
+    this.fc++;
+    const now=performance.now();
+    if(now-this.fpsT>500){this.fps=this.fc/((now-this.fpsT)/1000);this.fc=0;this.fpsT=now;}
+
+    ctx.save();
+    this.shake.update();
+    const so=this.shake.get();
+    ctx.translate(so.x,so.y);
+
+    // Mirrored video
+    ctx.save(); ctx.translate(W,0); ctx.scale(-1,1);
+    ctx.drawImage(this.video,0,0,W,H); ctx.restore();
+
+    // Vignette overlay
+    const vg=ctx.createRadialGradient(W/2,H/2,W*0.25,W/2,H/2,W*0.72);
+    vg.addColorStop(0,'rgba(6,6,15,0.15)');
+    vg.addColorStop(1,'rgba(6,6,15,0.5)');
+    ctx.fillStyle=vg; ctx.fillRect(0,0,W,H);
+
+    // Subtle scanlines
+    ctx.fillStyle='rgba(0,0,0,0.04)';
+    for(let y=0;y<H;y+=3) ctx.fillRect(0,y,W,1);
+
+    // ── Process hands ──
+    const gunStates = [];
+    const hands = results.multiHandLandmarks || [];
+
+    for(let hi=0; hi<hands.length; hi++){
+      // Mirror x-coordinates to match the mirrored video display
+      const rawLm = hands[hi];
+      const lm = rawLm.map(l => ({x: 1-l.x, y: l.y, z: l.z||0}));
+      const det = this.detectors[hi] || this.detectors[0];
+
+      // Draw hand skeleton
+      this._drawHand(ctx, lm, W, H);
+
+      // Detect gesture
+      const r = det.detect(lm, W, H);
+
+      if(r.isGun){
+        gunStates.push({state: r.thumbState, thumbOpen: r.thumbOpen});
+
+        // Hand scale for gun sizing
+        const wristPx={x:lm[WRIST].x*W,y:lm[WRIST].y*H};
+        const midMcpPx={x:lm[MID_MCP].x*W,y:lm[MID_MCP].y*H};
+        const handScale = v2len(v2sub(midMcpPx,wristPx)) / 120;
+
+        // Draw gun
+        this.gun.draw(ctx, r.tipMid.x, r.tipMid.y, r.angle, handScale, r.thumbState, this.recoil);
+
+        // Laser
+        this._drawLaser(ctx, r.barrelTip, r.angle, W, H);
+
+        // Crosshair
+        this.hud.crosshair={x:clamp(r.aimPt.x,0,W),y:clamp(r.aimPt.y,0,H)};
+
+        // Fire
+        if(r.fired) this._fire(r.barrelTip, r.angle, r.aimPt);
+      }
+
+      // Reload: all fingers extended (open hand)
+      if(det.detectReload(lm)){
+        if(!this.hud.reloading && this.hud.ammo<AMMO_MAX){
+          this.hud.startReload();
+          this.audio.reload();
+        }
+      }
+    }
+
+    this.hud.guns = gunStates;
+    if(gunStates.length===0) this.hud.crosshair=null;
+
+    // ── Update & draw effects ──
+    this.particles.update(); this.flash.update(); this.shake.update();
+    this.recoil *= 0.85;
+    this.shells=this.shells.filter(s=>s.update());
+
+    this.shells.forEach(s=>s.draw(ctx));
+    this.particles.draw(ctx);
+    this.flash.draw(ctx);
+    this.hud.update(this.fps);
+    this.hud.draw(ctx);
+
+    ctx.restore();
+  }
+
+  _drawHand(ctx, lm, W, H){
+    const pts=lm.map(l=>({x:l.x*W, y:l.y*H, z:l.z||0}));
+
+    const conns=[
+      [0,1],[1,2],[2,3],[3,4],
+      [0,5],[5,6],[6,7],[7,8],
+      [5,9],[9,10],[10,11],[11,12],
+      [9,13],[13,14],[14,15],[15,16],
+      [13,17],[17,18],[18,19],[19,20],
+      [0,17],[5,9],[9,13],[13,17]
+    ];
+
+    // Lines
+    conns.forEach(([a,b])=>{
+      const dz=(pts[a].z+pts[b].z)/2;
+      const df=1-clamp(dz*5,-0.5,0.5);
+
+      // Glow
+      ctx.globalAlpha=0.12*df;
+      ctx.strokeStyle='#0ef'; ctx.lineWidth=8;
+      ctx.beginPath(); ctx.moveTo(pts[a].x,pts[a].y); ctx.lineTo(pts[b].x,pts[b].y); ctx.stroke();
+
+      // Line
+      ctx.globalAlpha=0.5+df*0.3;
+      ctx.strokeStyle='rgba(0,238,255,0.7)'; ctx.lineWidth=1.5+df*0.5;
+      ctx.beginPath(); ctx.moveTo(pts[a].x,pts[a].y); ctx.lineTo(pts[b].x,pts[b].y); ctx.stroke();
+    });
+    ctx.globalAlpha=1;
+
+    // Joints
+    const tips=new Set([4,8,12,16,20]);
+    pts.forEach((p,i)=>{
+      const df=1-clamp(p.z*5,-0.5,0.5);
+      const isTip=tips.has(i);
+      const r=(isTip?4:2.5)*(.7+df*.5);
+      const col=isTip?'#f0f':'#0ef';
+
+      ctx.fillStyle=col;
+      ctx.globalAlpha=0.6+df*0.4;
+      ctx.beginPath(); ctx.arc(p.x,p.y,r,0,Math.PI*2); ctx.fill();
+
+      if(isTip){
+        ctx.fillStyle='rgba(255,255,255,0.5)';
+        ctx.beginPath(); ctx.arc(p.x,p.y,r*0.35,0,Math.PI*2); ctx.fill();
+      }
+    });
+    ctx.globalAlpha=1;
+  }
+
+  _drawLaser(ctx, origin, angle, W, H){
+    const dist=Math.sqrt(W*W+H*H);
+    ctx.save();
+    ctx.setLineDash([6,6]);
+    ctx.strokeStyle='rgba(255,40,40,0.35)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(origin.x,origin.y);
+    ctx.lineTo(origin.x+Math.cos(angle)*dist,origin.y+Math.sin(angle)*dist);
+    ctx.stroke(); ctx.setLineDash([]);
+
+    // Dot
+    const dd=180;
+    const dx=origin.x+Math.cos(angle)*dd, dy=origin.y+Math.sin(angle)*dd;
+    if(dx>=0&&dx<W&&dy>=0&&dy<H){
+      ctx.fillStyle='rgba(255,50,50,0.6)';
+      ctx.shadowColor='rgba(255,0,0,0.4)'; ctx.shadowBlur=12;
+      ctx.beginPath(); ctx.arc(dx,dy,3.5,0,Math.PI*2); ctx.fill();
+      ctx.shadowBlur=0;
+    }
+    ctx.restore();
+  }
+
+  _fire(barrelTip, angle, aimPt){
+    if(this.hud.fire()){
+      this.flash.fire(barrelTip.x, barrelTip.y, angle);
+      this.particles.sparks(barrelTip.x, barrelTip.y, angle);
+      this.particles.smoke(barrelTip.x, barrelTip.y, angle);
+      this.shells.push(new Shell(barrelTip.x, barrelTip.y, angle-Math.PI/2));
+      this.shake.fire();
+      this.recoil=1;
+
+      this.flashEl.style.opacity='0.25';
+      setTimeout(()=>{this.flashEl.style.opacity='0';},60);
+
+      this.hud.addHit(clamp(aimPt.x,0,this.W),clamp(aimPt.y,0,this.H));
+      this.audio.shot();
+    } else {
+      this.audio.empty();
+    }
+  }
+}
+
+// ════════════════════════ INIT ════════════════════════
+const app = new App();
+app.start().catch(err=>{
+  console.error(err);
+  const s=document.querySelector('#loading .status');
+  s.textContent='ERROR: '+err.message; s.style.color='#f44';
+});
+</script>
+</body>
+</html>
