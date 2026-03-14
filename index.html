@@ -57,7 +57,7 @@
 // ════════════════════════ CONSTANTS ════════════════════════
 const AMMO_MAX        = 12;
 const RELOAD_FRAMES   = 55;
-const FIRE_COOLDOWN   = 14;
+const FIRE_COOLDOWN   = 6;
 const BARREL_LEN      = 100;
 const MUZZLE_FRAMES   = 9;
 const SHAKE_MAG       = 10;
@@ -82,6 +82,61 @@ const clamp  = (v,lo,hi) => Math.max(lo,Math.min(hi,v));
 function dist3(a,b) {
   const dx=a.x-b.x, dy=a.y-b.y, dz=(a.z||0)-(b.z||0);
   return Math.sqrt(dx*dx+dy*dy+dz*dz);
+}
+
+// ════════════════════════ ONE-EURO FILTER ════════════════════════
+// Adaptive low-pass filter: aggressive smoothing when still (kills jitter),
+// light smoothing when moving fast (no lag). Ideal for hand tracking.
+class OneEuroFilter1D {
+  constructor(freq=30, mincutoff=1.0, beta=0.007, dcutoff=1.0){
+    this.freq=freq; this.mincutoff=mincutoff; this.beta=beta; this.dcutoff=dcutoff;
+    this.x=null; this.dx=0; this.lastTime=null;
+  }
+  _alpha(cutoff,dt){ const te=1.0/(2*Math.PI*cutoff); return 1.0/(1.0+te/dt); }
+  filter(val, timestamp){
+    if(this.x===null){ this.x=val; this.lastTime=timestamp; return val; }
+    const dt=Math.max(1e-6,(timestamp-this.lastTime)/1000);
+    this.lastTime=timestamp;
+    const ad=this._alpha(this.dcutoff,dt);
+    const dx=(val-this.x)/dt;
+    this.dx=this.dx*(1-ad)+dx*ad;
+    const cutoff=this.mincutoff+this.beta*Math.abs(this.dx);
+    const a=this._alpha(cutoff,dt);
+    this.x=this.x*(1-a)+val*a;
+    return this.x;
+  }
+  reset(){ this.x=null; this.dx=0; this.lastTime=null; }
+}
+
+class LandmarkSmoother {
+  constructor(freq=30, mincutoff=1.5, beta=0.01){
+    this.freq=freq; this.mc=mincutoff; this.beta=beta;
+    this.filters=null;
+  }
+  smooth(landmarks){
+    const now=performance.now();
+    if(!this.filters||this.filters.length!==landmarks.length){
+      this.filters=landmarks.map(()=>({
+        x:new OneEuroFilter1D(this.freq,this.mc,this.beta),
+        y:new OneEuroFilter1D(this.freq,this.mc,this.beta),
+        z:new OneEuroFilter1D(this.freq,this.mc,this.beta),
+      }));
+    }
+    return landmarks.map((l,i)=>({
+      x:this.filters[i].x.filter(l.x,now),
+      y:this.filters[i].y.filter(l.y,now),
+      z:this.filters[i].z.filter(l.z||0,now),
+    }));
+  }
+  reset(){ this.filters=null; }
+}
+
+function smoothAngle(prev, curr, alpha) {
+  if(prev===null) return curr;
+  let diff=curr-prev;
+  while(diff>Math.PI) diff-=Math.PI*2;
+  while(diff<-Math.PI) diff+=Math.PI*2;
+  return prev+diff*alpha;
 }
 
 // ════════════════════════ AUDIO ════════════════════════
@@ -284,6 +339,7 @@ class GestureDetector {
     this.stableFrames=0;
     this.prevThumbProj=null;
     this.smoothThumbProj=0;
+    this.prevAngle=null; // for angle smoothing
   }
 
   // Finger curl: ratio of direct distance to chain distance (3D)
@@ -293,14 +349,14 @@ class GestureDetector {
     return chain<1e-6?1:direct/chain;
   }
 
-  // Is finger extended? (orientation-independent)
+  // Is finger extended? (orientation-independent, loosened for multi-angle)
   _extended(lm,mcp,pip,dip,tip){
-    return this._curlRatio(lm,mcp,pip,dip,tip) > 0.72;
+    return this._curlRatio(lm,mcp,pip,dip,tip) > 0.62;
   }
 
   // Is finger curled?
   _curled(lm,mcp,pip,dip,tip){
-    return this._curlRatio(lm,mcp,pip,dip,tip) < 0.68;
+    return this._curlRatio(lm,mcp,pip,dip,tip) < 0.58;
   }
 
   /**
@@ -328,16 +384,40 @@ class GestureDetector {
     // Gun: index + middle extended, ring + pinky curled
     const isGun = indexExt && midExt && ringCurl && pinkyCurl;
 
-    // ── Barrel direction (average of index and middle finger directions) ──
+    // ── Barrel direction (blended wrist→tip + MCP→tip for stability) ──
+    const wrist={x:lm[WRIST].x*w,y:lm[WRIST].y*h};
     const iMcp={x:lm[INDEX_MCP].x*w,y:lm[INDEX_MCP].y*h};
+    const mMcp={x:lm[MID_MCP].x*w,y:lm[MID_MCP].y*h};
     const iTip={x:lm[INDEX_TIP].x*w,y:lm[INDEX_TIP].y*h};
     const mTip={x:lm[MID_TIP].x*w,y:lm[MID_TIP].y*h};
     // Midpoint between index and middle fingertips
     const tipMid = {x:(iTip.x+mTip.x)/2, y:(iTip.y+mTip.y)/2};
-    const angle = Math.atan2(tipMid.y-iMcp.y, tipMid.x-iMcp.x);
+    // Palm center — anchor for the gun grip
+    const palmCenter = {x:(wrist.x+iMcp.x+mMcp.x)/3, y:(wrist.y+iMcp.y+mMcp.y)/3};
+    // Blend wrist→tip (stable) with MCP→tip (accurate) for robust angle
+    const a1 = Math.atan2(tipMid.y-wrist.y, tipMid.x-wrist.x);
+    const a2 = Math.atan2(tipMid.y-iMcp.y, tipMid.x-iMcp.x);
+    const rawAngle = Math.atan2(
+      Math.sin(a1)*0.35 + Math.sin(a2)*0.65,
+      Math.cos(a1)*0.35 + Math.cos(a2)*0.65
+    );
+    // Smooth the angle across frames to kill jitter
+    this.prevAngle = smoothAngle(this.prevAngle, rawAngle, 0.45);
+    const angle = this.prevAngle;
     const dx=Math.cos(angle), dy=Math.sin(angle);
-    const barrelTip = {x:tipMid.x+dx*BARREL_LEN, y:tipMid.y+dy*BARREL_LEN};
+    const barrelTip = {x:tipMid.x+dx*BARREL_LEN*0.7, y:tipMid.y+dy*BARREL_LEN*0.7};
     const aimPt     = {x:tipMid.x+dx*500, y:tipMid.y+dy*500};
+    // Grip anchor — slightly behind iMcp along barrel axis for natural grip
+    const gripPt = {x:iMcp.x-dx*10, y:iMcp.y-dy*10};
+
+    // ── Auto-detect gun flip based on wrist position relative to barrel ──
+    // Perpendicular to barrel (points toward where grip is drawn: positive local Y)
+    const perpX = -dy, perpY = dx;
+    // Check which side of the barrel the wrist is on
+    const toWristX = wrist.x - gripPt.x, toWristY = wrist.y - gripPt.y;
+    const wristSide = toWristX * perpX + toWristY * perpY;
+    // If wrist is on the opposite side from where grip is drawn, flip the gun
+    const flipGun = wristSide < 0;
 
     // ── Thumb state machine for firing ──
     const thumbOpen = this._thumbOpenness(lm);
@@ -353,8 +433,8 @@ class GestureDetector {
       // Distance-based thresholds (normalized by hand size)
       // Thumb up/extended: tp ~0.7-1.2 → cocked
       // Thumb pressed/down: tp ~0.25-0.45 → fire
-      const COCK_THRESH = 0.55;   // thumb clearly extended
-      const FIRE_THRESH = 0.42;   // thumb has pressed down
+      const COCK_THRESH = 0.50;   // thumb clearly extended
+      const FIRE_THRESH = 0.40;   // thumb has pressed down
 
       if(this.stableFrames >= 1){
         if(tp > COCK_THRESH){
@@ -375,11 +455,12 @@ class GestureDetector {
     } else {
       this.stableFrames = 0;
       this.thumbState = 'idle';
+      this.prevAngle = null; // reset angle smoothing when gun lost
     }
 
     if(this.cooldown>0) this.cooldown--;
 
-    return {isGun, fired, barrelTip, aimPt, angle, tipMid, iMcp, thumbOpen:tp, thumbState:this.thumbState};
+    return {isGun, fired, barrelTip, aimPt, angle, tipMid, iMcp, gripPt, palmCenter, flipGun, thumbOpen:tp, thumbState:this.thumbState};
   }
 
   detectReload(lm){
@@ -400,10 +481,12 @@ class GunRenderer {
    * Draw a detailed pistol silhouette aligned to the hand.
    * The gun is drawn in local coordinates then transformed.
    */
-  draw(ctx, anchorX, anchorY, angle, handScale, thumbState, recoil){
+  draw(ctx, anchorX, anchorY, angle, handScale, thumbState, recoil, flip=false){
     ctx.save();
     ctx.translate(anchorX, anchorY);
     ctx.rotate(angle);
+    // Flip gun vertically when wrist is on opposite side (e.g. left hand)
+    if(flip) ctx.scale(1, -1);
 
     const sc = handScale * 0.9; // scale relative to hand size
     ctx.scale(sc, sc);
@@ -650,14 +733,14 @@ class HUD {
       ctx.fillRect(22, 100, 120, 6);
       // Fill based on thumb openness (0-1.2 range mapped to bar)
       const barW = clamp(tVal / 1.2, 0, 1) * 120;
-      const barCol = tVal > 0.55 ? 'rgba(255,255,0,0.6)' : tVal < 0.42 ? 'rgba(255,60,60,0.6)' : 'rgba(255,255,255,0.3)';
+      const barCol = tVal > 0.50 ? 'rgba(255,255,0,0.6)' : tVal < 0.40 ? 'rgba(255,60,60,0.6)' : 'rgba(255,255,255,0.3)';
       ctx.fillStyle=barCol;
       ctx.fillRect(22, 100, barW, 6);
       // Threshold markers
       ctx.fillStyle='rgba(255,255,0,0.5)';
-      ctx.fillRect(22 + (0.55/1.2)*120, 98, 1, 10); // cock threshold
+      ctx.fillRect(22 + (0.50/1.2)*120, 98, 1, 10); // cock threshold
       ctx.fillStyle='rgba(255,60,60,0.5)';
-      ctx.fillRect(22 + (0.42/1.2)*120, 98, 1, 10); // fire threshold
+      ctx.fillRect(22 + (0.40/1.2)*120, 98, 1, 10); // fire threshold
       // Value text
       ctx.fillStyle='rgba(255,255,255,0.3)';
       ctx.font=`400 9px ${mono}`;
@@ -747,6 +830,7 @@ class App {
     this.flashEl=document.getElementById('flash');
 
     this.detectors=[new GestureDetector(), new GestureDetector()]; // one per hand
+    this.smoothers=[new LandmarkSmoother(), new LandmarkSmoother()]; // per-hand One-Euro filter
     this.particles=new Particles();
     this.flash=new MuzzleFlash();
     this.shells=[];
@@ -789,8 +873,8 @@ class App {
     this.hands.setOptions({
       maxNumHands: 2,
       modelComplexity: 1,
-      minDetectionConfidence: 0.65,
-      minTrackingConfidence: 0.5,
+      minDetectionConfidence: 0.55,
+      minTrackingConfidence: 0.45,
     });
     this.hands.onResults(r=>this._frame(r));
 
@@ -835,10 +919,16 @@ class App {
     const gunStates = [];
     const hands = results.multiHandLandmarks || [];
 
+    // Reset smoothers for hands that disappeared
+    for(let i=hands.length; i<this.smoothers.length; i++) this.smoothers[i].reset();
+
     for(let hi=0; hi<hands.length; hi++){
       // Mirror x-coordinates to match the mirrored video display
       const rawLm = hands[hi];
-      const lm = rawLm.map(l => ({x: 1-l.x, y: l.y, z: l.z||0}));
+      const mirrored = rawLm.map(l => ({x: 1-l.x, y: l.y, z: l.z||0}));
+      // Smooth landmarks with EMA to reduce jitter
+      const smoother = this.smoothers[hi] || this.smoothers[0];
+      const lm = smoother.smooth(mirrored);
       const det = this.detectors[hi] || this.detectors[0];
 
       // Draw hand skeleton
@@ -855,8 +945,8 @@ class App {
         const midMcpPx={x:lm[MID_MCP].x*W,y:lm[MID_MCP].y*H};
         const handScale = v2len(v2sub(midMcpPx,wristPx)) / 120;
 
-        // Draw gun
-        this.gun.draw(ctx, r.tipMid.x, r.tipMid.y, r.angle, handScale, r.thumbState, this.recoil);
+        // Draw gun anchored at grip point (INDEX_MCP area), auto-flip for left hand
+        this.gun.draw(ctx, r.gripPt.x, r.gripPt.y, r.angle, handScale, r.thumbState, this.recoil, r.flipGun);
 
         // Laser
         this._drawLaser(ctx, r.barrelTip, r.angle, W, H);
